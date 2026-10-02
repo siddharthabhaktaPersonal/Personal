@@ -74,25 +74,46 @@
 #include <stddef.h>
 #include "atomic_hashdefs.h"
 
-/* Deliberately named lfq_rdtsc(), not rdtsc() -- lockfree_list.h
- * already defines a same-signature "unsigned long long rdtsc(void)".
- * This header has no dependency on lockfree_list.h (this queue is
- * fully standalone), but giving it a distinct symbol name means a
- * translation unit is free to include both headers together (e.g. a
- * future combined benchmark) without a duplicate-definition error. */
-__inline__ unsigned long long lfq_rdtsc(void)
-{
-  unsigned hi, lo;
-  __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
-  return ( (unsigned long long)lo)|( ((unsigned long long)hi)<<32 );
+/* Timing is opt-in because shared profiling counters contend between
+ * producers and consumers. Non-x86 builds can supply LFQ_READ_CYCLES(). */
+#ifndef LF_QUEUE_ENABLE_STATS
+#define LF_QUEUE_ENABLE_STATS 0
+#endif
+
+#if LF_QUEUE_ENABLE_STATS
+/* The bundled timing harness enables stats on x86. Portable library builds
+ * leave them off; targets can provide LFQ_READ_CYCLES() for a native timer. */
+#ifndef LFQ_READ_CYCLES
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#define LFQ_READ_CYCLES() __rdtsc()
+#elif defined(__i386__) || defined(__x86_64__)
+static inline unsigned long long lfq_rdtsc(void) {
+    unsigned hi, lo;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((unsigned long long)lo) | (((unsigned long long)hi) << 32);
 }
+#define LFQ_READ_CYCLES() lfq_rdtsc()
+#else
+#error "Define LFQ_READ_CYCLES() when LF_QUEUE_ENABLE_STATS is enabled on this target"
+#endif
+#endif
+#endif
 
 typedef struct lf_qnode lf_qnode_t; /* opaque; defined in lockfree_queue.c */
 
 typedef struct {
-    lf_atomic_uptr_t head; /* -> lf_qnode_t, the permanent dummy/sentinel */
-    lf_atomic_uptr_t tail; /* -> lf_qnode_t, may transiently lag the real last node */
+    lf_atomic_uptr_t value;
+    unsigned char padding[LF_CACHELINE_SIZE - sizeof(lf_atomic_uptr_t)];
+} lf_queue_atomic_line_t;
+
+typedef struct {
+    lf_queue_atomic_line_t head; /* permanent dummy/sentinel */
+    lf_queue_atomic_line_t tail; /* may transiently lag the real last node */
 } lf_queue_t;
+
+/* Queue layout changed to isolate head and tail on separate cache lines;
+ * rebuild callers when upgrading this header. */
 
 /* Call once, before any thread touches the queue. Also brings up the
  * global hazard-pointer subsystem -- see the big comment above about
@@ -114,10 +135,9 @@ int lf_queue_insert(lf_queue_t *q, void *value, int tid);
  * untouched. O(1): no search, unlike lf_list_delete(). */
 int lf_queue_fetch_first(lf_queue_t *q, void **out_value, int tid);
 
-/* rdtsc-cycle accumulators, same pattern as lockfree_list.h's
- * cons_cycles/prod_cycles -- updated with __atomic_fetch_add (see the
- * comment in lockfree_list.c about why '+=' on these is a data race
- * under concurrent callers) inside lf_queue_insert()/fetch_first(). */
+/* Optional cycle accumulators. Compile lockfree_queue.c with
+ * -DLF_QUEUE_ENABLE_STATS=1 to collect them. Stats are off by default.
+ * When enabled outside x86, define LFQ_READ_CYCLES() to a target timer. */
 extern volatile unsigned long long qins_cycles, qins_count;
 extern volatile unsigned long long qdeq_cycles, qdeq_count;
 

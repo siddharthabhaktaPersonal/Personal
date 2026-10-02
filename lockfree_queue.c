@@ -10,6 +10,20 @@
 volatile unsigned long long qins_cycles = 0, qins_count = 0;
 volatile unsigned long long qdeq_cycles = 0, qdeq_count = 0;
 
+#if LF_QUEUE_ENABLE_STATS
+#define LFQ_STATS_DECLARE unsigned long long start, end
+#define LFQ_STATS_START() (start = LFQ_READ_CYCLES())
+#define LFQ_STATS_UPDATE(cycles, count) do { \
+    end = LFQ_READ_CYCLES(); \
+    __atomic_fetch_add(&(cycles), end - start, __ATOMIC_RELAXED); \
+    __atomic_fetch_add(&(count), 1, __ATOMIC_RELAXED); \
+} while (0)
+#else
+#define LFQ_STATS_DECLARE
+#define LFQ_STATS_START() ((void)0)
+#define LFQ_STATS_UPDATE(cycles, count) ((void)0)
+#endif
+
 /* Hazard-pointer slot roles (must fit within LF_HP_SLOTS_PER_THREAD ==
  * 2, same as lockfree_list.c -- see hazard_ptr.h). insert() only ever
  * needs one slot at a time (TAIL); fetch_first() needs two (HEAD and
@@ -35,26 +49,32 @@ void lf_queue_init(lf_queue_t *q) {
 
     hp_init(reclaim_qnode);
 
+    lf_store_uptr(&q->head.value, 0);
+    lf_store_uptr(&q->tail.value, 0);
+
     dummy = (lf_qnode_t *)malloc(sizeof(lf_qnode_t));
+    if (dummy == NULL) {
+        return;
+    }
     dummy->value = NULL;
     lf_store_uptr(&dummy->next, 0);
 
-    lf_store_uptr(&q->head, (uintptr_t)dummy);
-    lf_store_uptr(&q->tail, (uintptr_t)dummy);
+    lf_store_uptr(&q->head.value, (uintptr_t)dummy);
+    lf_store_uptr(&q->tail.value, (uintptr_t)dummy);
     lf_fence();
 }
 
 void lf_queue_destroy(lf_queue_t *q) {
     int t;
-    lf_qnode_t *cur = (lf_qnode_t *)lf_load_uptr(&q->head);
+    lf_qnode_t *cur = (lf_qnode_t *)lf_load_uptr(&q->head.value);
 
     while (cur != NULL) {
         lf_qnode_t *next = (lf_qnode_t *)lf_load_uptr(&cur->next);
         reclaim_qnode(cur);
         cur = next;
     }
-    lf_store_uptr(&q->head, 0);
-    lf_store_uptr(&q->tail, 0);
+    lf_store_uptr(&q->head.value, 0);
+    lf_store_uptr(&q->tail.value, 0);
 
     /* Same rationale as lf_list_destroy(): drain every thread's
      * retire list so a node this destroy() didn't see via the chain
@@ -74,29 +94,30 @@ void lf_queue_destroy(lf_queue_t *q) {
  * -- that's what the `else` branch below does -- so the queue can
  * never get wedged behind a slow/descheduled producer. */
 int lf_queue_insert(lf_queue_t *q, void *value, int tid) {
-    unsigned long long start, end;
+    LFQ_STATS_DECLARE;
     lf_qnode_t *node = (lf_qnode_t *)malloc(sizeof(lf_qnode_t));
     uintptr_t tail_raw, next_raw;
 
-    if (node == NULL) {
+    if (node == NULL || lf_load_uptr(&q->tail.value) == 0) {
+        free(node);
         return 0;
     }
     node->value = value;
     lf_store_uptr(&node->next, 0);
 
-    start = lfq_rdtsc();
+    LFQ_STATS_START();
 
     for (;;) {
         lf_qnode_t *tail;
 
-        tail_raw = lf_load_uptr(&q->tail);
+        tail_raw = lf_load_uptr(&q->tail.value);
         tail = (lf_qnode_t *)tail_raw;
         hp_set(tid, HP_Q_TAIL, tail);
         /* Publish-then-validate (same discipline as lf_search() in
          * lockfree_list.c): if Q->Tail already moved on from the
          * snapshot we just protected, `tail` may already be retired
          * elsewhere -- don't dereference it, just retry. */
-        if (lf_load_uptr(&q->tail) != tail_raw) {
+        if (lf_load_uptr(&q->tail.value) != tail_raw) {
             continue;
         }
 
@@ -104,7 +125,7 @@ int lf_queue_insert(lf_queue_t *q, void *value, int tid) {
         /* Re-check Tail is still consistent with what we read next
          * from (M&S's own "if (tail == Q->Tail)" double-check) before
          * acting on `next_raw`. */
-        if (lf_load_uptr(&q->tail) != tail_raw) {
+        if (lf_load_uptr(&q->tail.value) != tail_raw) {
             continue;
         }
 
@@ -117,28 +138,26 @@ int lf_queue_insert(lf_queue_t *q, void *value, int tid) {
                  * correctness: if it loses, some other thread already
                  * did it for us (the `else` branch below, run from
                  * inside their own insert() or fetch_first()). */
-                lf_cas_uptr(&q->tail, tail_raw, (uintptr_t)node);
+                lf_cas_uptr(&q->tail.value, tail_raw, (uintptr_t)node);
                 break;
             }
         } else {
             /* Tail is lagging one node behind the real end of the
              * list (another producer finished its first CAS but not
              * its second) -- help it catch up before retrying. */
-            lf_cas_uptr(&q->tail, tail_raw, next_raw);
+            lf_cas_uptr(&q->tail.value, tail_raw, next_raw);
         }
         lf_cpu_relax();
     }
 
     hp_clear_all(tid);
-    end = lfq_rdtsc();
     /* __atomic_fetch_add, not '+=' -- see the identical comment in
      * lockfree_list.c's lf_list_insert(): these counters are written
      * from every producer thread, so a plain '+=' would be a lost-
      * update data race under concurrent callers. __ATOMIC_RELAXED is
      * enough since they carry no ordering relationship with anything
      * else and are pure statistics. */
-    __atomic_fetch_add(&qins_cycles, (end - start), __ATOMIC_RELAXED);
-    __atomic_fetch_add(&qins_count, 1, __ATOMIC_RELAXED);
+    LFQ_STATS_UPDATE(qins_cycles, qins_count);
     return 1;
 }
 
@@ -150,22 +169,25 @@ int lf_queue_insert(lf_queue_t *q, void *value, int tid) {
  * to that node (which becomes the new dummy) and hands back the value
  * read out of it; the old dummy is now unreachable and is retired. */
 int lf_queue_fetch_first(lf_queue_t *q, void **out_value, int tid) {
-    unsigned long long start, end;
+    LFQ_STATS_DECLARE;
     lf_qnode_t *head, *tail, *next;
     uintptr_t head_raw, tail_raw, next_raw;
     void *value = NULL;
 
-    start = lfq_rdtsc();
+    if (lf_load_uptr(&q->head.value) == 0) {
+        return 0;
+    }
+    LFQ_STATS_START();
 
     for (;;) {
-        head_raw = lf_load_uptr(&q->head);
+        head_raw = lf_load_uptr(&q->head.value);
         head = (lf_qnode_t *)head_raw;
         hp_set(tid, HP_Q_HEAD, head);
-        if (lf_load_uptr(&q->head) != head_raw) {
+        if (lf_load_uptr(&q->head.value) != head_raw) {
             continue; /* head already moved/retired; restart, don't deref */
         }
 
-        tail_raw = lf_load_uptr(&q->tail);
+        tail_raw = lf_load_uptr(&q->tail.value);
         tail = (lf_qnode_t *)tail_raw;
 
         next_raw = lf_load_uptr(&head->next);
@@ -175,7 +197,7 @@ int lf_queue_fetch_first(lf_queue_t *q, void **out_value, int tid) {
          * on `next` being a safe-to-dereference snapshot of it (M&S's
          * "if (Q->Head == head)" check) -- see lf_queue_insert()'s
          * matching comment for why this order matters. */
-        if (lf_load_uptr(&q->head) != head_raw) {
+        if (lf_load_uptr(&q->head.value) != head_raw) {
             continue;
         }
 
@@ -184,21 +206,19 @@ int lf_queue_fetch_first(lf_queue_t *q, void **out_value, int tid) {
                 /* Head == Tail and Head->next == NULL: genuinely
                  * empty. */
                 hp_clear_all(tid);
-                end = lfq_rdtsc();
-                __atomic_fetch_add(&qdeq_cycles, (end - start), __ATOMIC_RELAXED);
-                __atomic_fetch_add(&qdeq_count, 1, __ATOMIC_RELAXED);
+                LFQ_STATS_UPDATE(qdeq_cycles, qdeq_count);
                 return 0;
             }
             /* Tail is lagging behind a completed-but-not-yet-swung
              * insert() (see lf_queue_insert()'s `else` branch) --
              * help it catch up, then retry. */
-            lf_cas_uptr(&q->tail, tail_raw, next_raw);
+            lf_cas_uptr(&q->tail.value, tail_raw, next_raw);
         } else {
             /* head != tail implies head->next cannot be NULL (head is
              * not the last node), so it's always safe to read the
              * value out of it here. */
             value = next->value;
-            if (lf_cas_uptr(&q->head, head_raw, next_raw)) {
+            if (lf_cas_uptr(&q->head.value, head_raw, next_raw)) {
                 break; /* dequeued; `head` (the old dummy) is now unlinked */
             }
         }
@@ -207,9 +227,7 @@ int lf_queue_fetch_first(lf_queue_t *q, void **out_value, int tid) {
 
     hp_retire(tid, head);
     hp_clear_all(tid);
-    end = lfq_rdtsc();
-    __atomic_fetch_add(&qdeq_cycles, (end - start), __ATOMIC_RELAXED);
-    __atomic_fetch_add(&qdeq_count, 1, __ATOMIC_RELAXED);
+    LFQ_STATS_UPDATE(qdeq_cycles, qdeq_count);
     if (out_value != NULL) {
         *out_value = value;
     }

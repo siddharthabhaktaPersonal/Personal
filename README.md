@@ -193,12 +193,35 @@ yourself exactly once (e.g. by calling only one of `lf_list_init()`/
 letting both run it. See the comment at the top of `lockfree_queue.h`
 for the full detail.
 
+### DPDK-inspired queue tuning
+
+The queue keeps the unbounded Michael-Scott linked-node algorithm, but
+uses a DPDK `rte_ring` performance lesson: producer and consumer state
+should not share a cache line. `head` and `tail` now occupy separate
+cache-line-sized slots, reducing cache-line bouncing when consumers
+move the head while producers move the tail. Queue timing is opt-in
+(`-DLF_QUEUE_ENABLE_STATS=1`); benchmark targets enable it, while normal
+library builds skip clock reads and shared counter updates. Non-x86
+targets build with stats disabled by default; to enable them, provide a
+native `LFQ_READ_CYCLES()` implementation. `lf_queue_t` has a new layout,
+so applications must rebuild against the updated header.
+
+DPDK's `rte_ring` is a bounded array-based queue with bulk operations;
+this queue remains unbounded and linked, so it does not inherit those
+capacity or API semantics. DPDK's core libraries use BSD-3-Clause, not
+public-domain terms. This change adopts the cache-line separation idea
+without copying DPDK implementation code.
+
 ### Building and testing
 
 ```sh
 make qtest        # self-test + 4-producer/4-consumer stress test (200,000 items)
 make qtsan         # + ThreadSanitizer
 make qasan         # + AddressSanitizer/UBSan
+make qarm-linux    # queue + hazard-pointer cross-compile for 32-bit ARM Linux
+make qaarch64-linux # queue + hazard-pointer cross-compile for AArch64 Linux
+make qnxp-cortexm  # queue + hazard-pointer objects for Cortex-M4
+make qnxp-ppc      # queue + hazard-pointer objects for NXP e200z4
 make qtest QARGS="0 1 2 3 4 5 6 7"   # pin the 8 worker threads to cores 0-7
 ./test_lockfree_queue --help          # full usage
 ```

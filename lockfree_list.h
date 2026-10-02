@@ -67,6 +67,9 @@ int lf_list_find(const lf_list_t *list, long key, void **out_value, int tid);
  * safe to call while other threads are mutating the list. */
 void lf_list_dump(const lf_list_t *list, void (*visit)(long key, void *value));
 
+/* Optional timing counters: compile lockfree_list.c with
+ * -DLF_ENABLE_STATS=1 to collect them. Disabled by default because the
+ * shared atomic increments serialize otherwise independent operations. */
 extern volatile unsigned long long cons_cycles, cons_count;
 extern volatile unsigned long long prod_cycles, prod_count;
 

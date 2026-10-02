@@ -14,6 +14,27 @@
 volatile unsigned long long cons_cycles=0, cons_count=0;
 volatile unsigned long long prod_cycles=0, prod_count=0;
 
+/* Per-operation timing and shared statistics are useful in the bundled
+ * benchmark, but the two global atomic increments serialize every writer.
+ * Keep them opt-in for applications that care about throughput. */
+#ifndef LF_ENABLE_STATS
+#define LF_ENABLE_STATS 0
+#endif
+
+#if LF_ENABLE_STATS
+#define LF_STATS_DECLARE(var) unsigned long long var
+#define LF_STATS_START(var) ((var) = rdtsc())
+#define LF_STATS_ADD(cycles, count, start) do { \
+    unsigned long long lf_end__ = rdtsc(); \
+    __atomic_fetch_add(&(cycles), (lf_end__ - (start)), __ATOMIC_RELAXED); \
+    __atomic_fetch_add(&(count), 1, __ATOMIC_RELAXED); \
+} while (0)
+#else
+#define LF_STATS_DECLARE(var)
+#define LF_STATS_START(var) ((void)0)
+#define LF_STATS_ADD(cycles, count, start) ((void)0)
+#endif
+
 /* Hazard-pointer slot roles used by lf_search() below (must match
  * LF_HP_SLOTS_PER_THREAD == 2 in hazard_ptr.h):
  *   HP_PRED - protects the current predecessor ("pred"): the last
@@ -186,19 +207,18 @@ try_again:
 }
 
 int lf_list_insert(lf_list_t *list, long key, void *value, int tid) {
-    unsigned long long start, end;
+    LF_STATS_DECLARE(start);
     lf_node_t *left, *right;
     lf_node_t *new_node = (lf_node_t *)malloc(sizeof(lf_node_t));
     new_node->key = key;
     new_node->value = value;
 
-    start = rdtsc();
+    LF_STATS_START(start);
 
     for (;;) {
         if (lf_search(list, key, &left, &right, tid)) {
             free(new_node);
             hp_clear_all(tid);
-            end = rdtsc();
             /* __atomic_fetch_add, not '+=' -- these globals are shared
              * across every thread calling lf_list_insert()/delete()
              * (see test_lockfree_list.c's N-writer stress test), and a
@@ -212,14 +232,12 @@ int lf_list_insert(lf_list_t *list, long key, void *value, int tid) {
              * pure statistics -- and deliberately not seq_cst, so this
              * instrumentation doesn't itself add extra full-barrier
              * cost to the very latency it's trying to measure. */
-            __atomic_fetch_add(&prod_cycles, (end-start), __ATOMIC_RELAXED);
-            __atomic_fetch_add(&prod_count, 1, __ATOMIC_RELAXED);
+            LF_STATS_ADD(prod_cycles, prod_count, start);
             return 0; /* already present */
         }
         lf_store_uptr(&new_node->next, (uintptr_t)right);
         if (lf_cas_uptr(&left->next, (uintptr_t)right, (uintptr_t)new_node)) {
             hp_clear_all(tid);
-            end = rdtsc();
             /* __atomic_fetch_add, not '+=' -- these globals are shared
              * across every thread calling lf_list_insert()/delete()
              * (see test_lockfree_list.c's N-writer stress test), and a
@@ -233,8 +251,7 @@ int lf_list_insert(lf_list_t *list, long key, void *value, int tid) {
              * pure statistics -- and deliberately not seq_cst, so this
              * instrumentation doesn't itself add extra full-barrier
              * cost to the very latency it's trying to measure. */
-            __atomic_fetch_add(&prod_cycles, (end-start), __ATOMIC_RELAXED);
-            __atomic_fetch_add(&prod_count, 1, __ATOMIC_RELAXED);
+            LF_STATS_ADD(prod_cycles, prod_count, start);
             return 1;
         }
         lf_cpu_relax(); /* lost the race against a concurrent mutator; retry */
@@ -244,18 +261,16 @@ int lf_list_insert(lf_list_t *list, long key, void *value, int tid) {
 }
 
 int lf_list_delete(lf_list_t *list, long key, int tid) {
-    unsigned long long start, end;
+    LF_STATS_DECLARE(start);
     lf_node_t *left, *right;
     uintptr_t right_next_val;
 
-    start = rdtsc();
+    LF_STATS_START(start);
 
     for (;;) {
         if (!lf_search(list, key, &left, &right, tid)) {
             hp_clear_all(tid);
-            end = rdtsc();
-            __atomic_fetch_add(&cons_cycles, (end-start), __ATOMIC_RELAXED);
-            __atomic_fetch_add(&cons_count, 1, __ATOMIC_RELAXED);
+            LF_STATS_ADD(cons_cycles, cons_count, start);
             return 0; /* not found */
         }
         right_next_val = lf_load_uptr(&right->next);
@@ -275,9 +290,7 @@ int lf_list_delete(lf_list_t *list, long key, int tid) {
         hp_retire(tid, right);
     }
     hp_clear_all(tid);
-    end = rdtsc();
-    cons_cycles+=(end-start);
-    cons_count++;
+    LF_STATS_ADD(cons_cycles, cons_count, start);
     return 1;
 }
 

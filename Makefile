@@ -47,7 +47,8 @@ QHDRS     := lockfree_queue.h hazard_ptr.h atomic_hashdefs.h
 
 .PHONY: all test tsan asan clang pc-test pc-tsan pc-asan \
         qtest qtsan qasan clean \
-        arm-linux aarch64-linux nxp-cortexm nxp-ppc
+        arm-linux aarch64-linux nxp-cortexm nxp-ppc \
+        qarm-linux qaarch64-linux qnxp-cortexm qnxp-ppc
 
 all: test
 
@@ -61,20 +62,20 @@ test: test_lockfree_list
 	./test_lockfree_list $(ARGS)
 
 test_lockfree_list: $(SRC) $(TESTSRC) $(HDRS)
-	$(CC) $(CSTD) $(WARN) $(OPT) -pthread -o $@ $(SRC) $(TESTSRC)
+	$(CC) $(CSTD) $(WARN) $(OPT) -DLF_ENABLE_STATS=1 -pthread -o $@ $(SRC) $(TESTSRC)
 
 tsan: $(SRC) $(TESTSRC) $(HDRS)
-	$(CC) $(CSTD) $(WARN) -O1 -g -fsanitize=thread -pthread \
+	$(CC) $(CSTD) $(WARN) -O1 -g -DLF_ENABLE_STATS=1 -fsanitize=thread -pthread \
 	    -o test_lockfree_list_tsan $(SRC) $(TESTSRC)
 	./test_lockfree_list_tsan $(ARGS)
 
 asan: $(SRC) $(TESTSRC) $(HDRS)
-	$(CC) $(CSTD) $(WARN) -O1 -g -fsanitize=address,undefined -pthread \
+	$(CC) $(CSTD) $(WARN) -O1 -g -DLF_ENABLE_STATS=1 -fsanitize=address,undefined -pthread \
 	    -o test_lockfree_list_asan $(SRC) $(TESTSRC)
 	./test_lockfree_list_asan $(ARGS)
 
 clang: $(SRC) $(TESTSRC) $(HDRS)
-	clang $(CSTD) $(WARN) $(OPT) -pthread -o test_lockfree_list_clang $(SRC) $(TESTSRC)
+	clang $(CSTD) $(WARN) $(OPT) -DLF_ENABLE_STATS=1 -pthread -o test_lockfree_list_clang $(SRC) $(TESTSRC)
 	./test_lockfree_list_clang
 
 # Single-producer/single-consumer handoff test -- see README.md
@@ -87,15 +88,15 @@ pc-test: test_producer_consumer
 	./test_producer_consumer $(PC_ARGS)
 
 test_producer_consumer: $(SRC) $(PCTESTSRC) $(HDRS)
-	$(CC) $(CSTD) $(WARN) $(OPT) -pthread -o $@ $(SRC) $(PCTESTSRC)
+	$(CC) $(CSTD) $(WARN) $(OPT) -DLF_ENABLE_STATS=1 -pthread -o $@ $(SRC) $(PCTESTSRC)
 
 pc-tsan: $(SRC) $(PCTESTSRC) $(HDRS)
-	$(CC) $(CSTD) $(WARN) -O1 -g -fsanitize=thread -pthread \
+	$(CC) $(CSTD) $(WARN) -O1 -g -DLF_ENABLE_STATS=1 -fsanitize=thread -pthread \
 	    -o test_producer_consumer_tsan $(SRC) $(PCTESTSRC)
 	./test_producer_consumer_tsan $(PC_ARGS)
 
 pc-asan: $(SRC) $(PCTESTSRC) $(HDRS)
-	$(CC) $(CSTD) $(WARN) -O1 -g -fsanitize=address,undefined -pthread \
+	$(CC) $(CSTD) $(WARN) -O1 -g -DLF_ENABLE_STATS=1 -fsanitize=address,undefined -pthread \
 	    -o test_producer_consumer_asan $(SRC) $(PCTESTSRC)
 	./test_producer_consumer_asan $(PC_ARGS)
 
@@ -108,15 +109,15 @@ qtest: test_lockfree_queue
 	./test_lockfree_queue $(QARGS)
 
 test_lockfree_queue: $(QSRC) $(QTESTSRC) $(QHDRS)
-	$(CC) $(CSTD) $(WARN) $(OPT) $(CFLAGS_EXTRA) -pthread -o $@ $(QSRC) $(QTESTSRC)
+	$(CC) $(CSTD) $(WARN) $(OPT) -DLF_QUEUE_ENABLE_STATS=1 $(CFLAGS_EXTRA) -pthread -o $@ $(QSRC) $(QTESTSRC)
 
 qtsan: $(QSRC) $(QTESTSRC) $(QHDRS)
-	$(CC) $(CSTD) $(WARN) -O1 -g -fsanitize=thread -pthread \
+	$(CC) $(CSTD) $(WARN) -O1 -g -DLF_QUEUE_ENABLE_STATS=1 -fsanitize=thread -pthread \
 	    -o test_lockfree_queue_tsan $(QSRC) $(QTESTSRC)
 	./test_lockfree_queue_tsan $(QARGS)
 
 qasan: $(QSRC) $(QTESTSRC) $(QHDRS)
-	$(CC) $(CSTD) $(WARN) -O1 -g -fsanitize=address,undefined -pthread \
+	$(CC) $(CSTD) $(WARN) -O1 -g -DLF_QUEUE_ENABLE_STATS=1 -fsanitize=address,undefined -pthread \
 	    -o test_lockfree_queue_asan $(QSRC) $(QTESTSRC)
 	./test_lockfree_queue_asan $(QARGS)
 
@@ -125,12 +126,28 @@ qasan: $(QSRC) $(QTESTSRC) $(QHDRS)
 # on real hardware/QEMU is outside this Makefile's scope -- see README.
 
 arm-linux: $(SRC) $(HDRS)
-	arm-linux-gnueabihf-gcc $(CSTD) $(WARN) $(OPT) -pthread \
+	arm-linux-gnueabihf-gcc $(CSTD) $(WARN) $(OPT) -DLF_ENABLE_STATS=1 -pthread \
 	    -o test_lockfree_list_armhf $(SRC) $(TESTSRC)
 
 aarch64-linux: $(SRC) $(HDRS)
-	aarch64-linux-gnu-gcc $(CSTD) $(WARN) $(OPT) -pthread \
+	aarch64-linux-gnu-gcc $(CSTD) $(WARN) $(OPT) -DLF_ENABLE_STATS=1 -pthread \
 	    -o test_lockfree_list_aarch64 $(SRC) $(TESTSRC)
+
+# Queue-only cross builds. Stats stay disabled so the library does not
+# require an architecture-specific cycle counter on embedded targets.
+qarm-linux: $(QSRC) $(QHDRS)
+	arm-linux-gnueabihf-gcc $(CSTD) $(WARN) $(OPT) -c lockfree_queue.c hazard_ptr.c
+
+qaarch64-linux: $(QSRC) $(QHDRS)
+	aarch64-linux-gnu-gcc $(CSTD) $(WARN) $(OPT) -c lockfree_queue.c hazard_ptr.c
+
+qnxp-cortexm: $(QSRC) $(QHDRS)
+	arm-none-eabi-gcc $(CSTD) $(WARN) -O2 -g -mcpu=cortex-m4 -mthumb \
+	    -DLF_TARGET_NXP=1 -c lockfree_queue.c hazard_ptr.c
+
+qnxp-ppc: $(QSRC) $(QHDRS)
+	powerpc-eabi-gcc $(CSTD) $(WARN) -O2 -g -mcpu=e200z4 \
+	    -DLF_TARGET_NXP=1 -c lockfree_queue.c hazard_ptr.c
 
 # Bare-metal NXP Cortex-M (e.g. LPC/Kinetis/i.MX RT/S32K): no OS, no
 # pthread -- compile the list itself (not the pthread test harness) to
